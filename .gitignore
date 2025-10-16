@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.h5
+*.dcm
+*.zip
+*.jpeg
+.DS_Store
+.env
