@@ -1,253 +1,254 @@
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import StreamingResponse
-import uvicorn
-import numpy as np
 import io
-import tempfile
-import pydicom
-from pydicom.pixel_data_handlers.util import apply_voi_lut
-from tensorflow.keras.models import load_model
+import cv2
+import numpy as np
+import tensorflow as tf
+from fastapi import FastAPI, File, UploadFile, Form
+from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, JSONResponse
+from starlette.responses import JSONResponse
 from PIL import Image
+import pydicom
+from reportlab.platypus import SimpleDocTemplate, Image as RLImage, Spacer, Paragraph
 from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
-import imghdr
+from reportlab.lib.styles import getSampleStyleSheet
+import matplotlib.pyplot as plt
+import tempfile 
+import os
 
-app = FastAPI()
+# -------------------------------
+# Initialize FastAPI app
+# -------------------------------
+app = FastAPI(title="Pneumonia Detection with Grad-CAM")
 
+# Serve static files (images generated)
+os.makedirs("static", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Load trained model
 MODEL_PATH = "saved_models/densenet_pneumonia.h5"
-model = load_model(MODEL_PATH)
+model = tf.keras.models.load_model(MODEL_PATH)
 
-# ----------------------------------------------------
-# Utility function: read DICOM safely
-# ----------------------------------------------------
-def read_dicom_as_image(path):
-    ds = pydicom.dcmread(path, force=True)
-    # Handle missing Transfer Syntax UID
-    if "TransferSyntaxUID" not in ds.file_meta:
-        ds.file_meta.TransferSyntaxUID = pydicom.uid.ImplicitVRLittleEndian
-    try:
-        data = apply_voi_lut(ds.pixel_array, ds)
-    except Exception:
-        data = ds.pixel_array
 
-    # Normalize and convert to RGB
-    data = data.astype(float)
-    data -= np.min(data)
-    data /= np.max(data)
-    data = np.stack([data]*3, axis=-1)  # grayscale -> RGB
-    img = Image.fromarray((data * 255).astype(np.uint8)).resize((224, 224))
-    img = np.array(img) / 255.0
-    return img, ds
+# -------------------------------
+# Utility: Load image (JPEG or DICOM)
+# -------------------------------
+def load_image(file: UploadFile):
+    if file.filename.lower().endswith(".dcm"):
+        ds = pydicom.dcmread(file.file)
+        pixel_array = ds.pixel_array.astype(float)
+        image = cv2.resize(pixel_array, (224, 224))
+        image = cv2.cvtColor(np.uint8(image / np.max(image) * 255), cv2.COLOR_GRAY2RGB)
+    else:
+        image = Image.open(file.file).convert("RGB")
+        image = image.resize((224, 224))
+        image = np.array(image)
 
-# ----------------------------------------------------
-# Utility function: make PDF report
-# ----------------------------------------------------
-def make_pdf_report(patient_info, predicted_prob, label):
-    buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=letter)
-    width, height = letter
+    img_array = image.astype(np.float32) / 255.0
+    img_array = np.expand_dims(img_array, axis=0)
+    return image, img_array
 
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(40, height - 60, "Pneumonia Detection Report")
+def generate_gradcam(model, img_array, power=1.0):
+    """
+    Generate Grad-CAM by computing gradient of output with respect to input.
+    This method works with ANY model architecture without needing to access internal layers.
+    """
+    
+    img_tensor = tf.cast(img_array, tf.float32)
+    
+    with tf.GradientTape() as tape:
+        tape.watch(img_tensor)
+        predictions = model(img_tensor, training=False)
+        
+        # Get predicted class
+        class_idx = tf.argmax(predictions[0])
+        class_channel = predictions[0, class_idx]
+    
+    # Compute gradients with respect to input image
+    grads = tape.gradient(class_channel, img_tensor)
+    
+    if grads is None:
+        raise ValueError("Gradients are None!")
+    
+    print(f"Predictions: {predictions[0]}")
+    print(f"Predicted class: {class_idx} (0=Normal, 1=Pneumonia)")
+    print(f"Confidence: {predictions[0, class_idx]:.4f}")
+    print(f"Gradients shape: {grads.shape}")
+    print(f"Gradients range: [{tf.reduce_min(grads):.6f}, {tf.reduce_max(grads):.6f}]")
+    
+    # Take absolute value and convert to numpy
+    grads = tf.abs(grads)[0]  # Remove batch dimension
+    
+    # Compute saliency map by taking max across channels
+    saliency = tf.reduce_max(grads, axis=-1).numpy()
+    
+    print(f"Saliency map range: [{np.min(saliency):.6f}, {np.max(saliency):.6f}]")
+    
+    # Normalize to [0, 1]
+    saliency = saliency - np.min(saliency)
+    saliency_max = np.max(saliency)
+    
+    if saliency_max > 0:
+        saliency /= saliency_max
+    else:
+        print("WARNING: Saliency map is all zeros!")
+        saliency = np.ones_like(saliency) * 0.5
+    
+    # Apply power for contrast
+    saliency = saliency ** power
+    
+    # Resize to 224x224 if needed
+    if saliency.shape != (224, 224):
+        saliency = cv2.resize(saliency, (224, 224))
+    
+    saliency = np.clip(saliency, 0, 1)
+    
+    print(f"Final saliency range: [{np.min(saliency):.6f}, {np.max(saliency):.6f}]")
+    
+    return saliency
 
-    c.setFont("Helvetica", 12)
-    c.drawString(40, height - 100, f"Patient Name: {patient_info.get('PatientName', 'Unknown')}")
-    c.drawString(40, height - 120, f"Patient ID: {patient_info.get('PatientID', 'Unknown')}")
-    c.drawString(40, height - 140, f"Study Date: {patient_info.get('StudyDate', 'Unknown')}")
-    c.drawString(40, height - 160, f"Additional Notes: {patient_info.get('Notes', 'N/A')}")
-    c.drawString(40, height - 200, f"Prediction: {label}")
-    c.drawString(40, height - 220, f"Probability (Pneumonia): {predicted_prob:.3f}")
 
-    c.showPage()
-    c.save()
-    buffer.seek(0)
-    return buffer
+def overlay_heatmap(original_img, heatmap, alpha=0.4):
+    """Overlay saliency heatmap on original image with medical-grade VIRIDIS colormap."""
+    
+    # Ensure heatmap is in [0, 1] range
+    heatmap = np.clip(heatmap, 0, 1)
+    
+    # Convert to 8-bit for OpenCV colormap
+    heatmap_uint8 = np.uint8(255 * heatmap)
+    
+    # Use TURBO (medical-grade) or HOT colormap instead of JET
+    # TURBO: cooler colors (blue/cyan) for low, warmer (yellow/red) for high - better for medical
+    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_TURBO)
+    
+    # Convert from BGR to RGB
+    heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+    
+    # Ensure original image is uint8
+    original_uint8 = np.uint8(np.clip(original_img * 255, 0, 255))
+    
+    # Blend images - reduce alpha for more balanced view
+    overlay = cv2.addWeighted(
+        original_uint8, 
+        1 - alpha, 
+        heatmap_color, 
+        alpha, 
+        0
+    )
+    
+    return Image.fromarray(overlay)
+# -------------------------------
+# Utility: PDF Report Generator
+# -------------------------------
+def create_pdf_report(original_img_path, heatmap_img_path, prediction_label, probability):
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    doc = SimpleDocTemplate(temp_file.name, pagesize=letter)
+    styles = getSampleStyleSheet()
+    content = []
 
-# ----------------------------------------------------
-# Endpoint: Predict + Generate PDF
-# ----------------------------------------------------
-@app.post("/predict/")
-async def predict_dicom(
+    content.append(Paragraph("<b>Pneumonia Detection Report</b>", styles["Title"]))
+    content.append(Spacer(1, 12))
+    content.append(Paragraph(f"Prediction: <b>{prediction_label}</b>", styles["Normal"]))
+    content.append(Paragraph(f"Confidence: <b>{probability * 100:.2f}%</b>", styles["Normal"]))
+    content.append(Spacer(1, 12))
+
+    content.append(Paragraph("Original X-ray:", styles["Heading3"]))
+    content.append(RLImage(original_img_path, width=250, height=250))
+    content.append(Spacer(1, 12))
+
+    content.append(Paragraph("Grad-CAM Heatmap:", styles["Heading3"]))
+    content.append(RLImage(heatmap_img_path, width=250, height=250))
+
+    doc.build(content)
+    temp_file.seek(0)
+    return temp_file
+
+
+# -------------------------------
+# API Endpoint with UI
+# -------------------------------
+@app.get("/", response_class=HTMLResponse)
+def main_page():
+    return """
+    <html>
+        <head>
+            <title>Pneumonia Detection UI</title>
+        </head>
+        <body style="font-family: Arial; margin: 50px;">
+            <h2>Pneumonia Detection with Grad-CAM</h2>
+            <form action="/predict" enctype="multipart/form-data" method="post">
+                <input name="file" type="file" accept=".jpeg,.jpg,.png,.dcm" required>
+                <br><br>
+                <label>Heatmap Power (contrast):</label>
+                <input type="number" step="0.1" name="power" value="2.0" min="0.5" max="5.0">
+                <br><br>
+                <label>Overlay Alpha (transparency):</label>
+                <input type="number" step="0.1" name="alpha" value="0.5" min="0.1" max="1.0">
+                <br><br>
+                <button type="submit">Predict</button>
+            </form>
+        </body>
+    </html>
+    """
+
+
+@app.post("/predict")
+async def predict(
     file: UploadFile = File(...),
-    patient_name: str = Form("Unknown"),
-    patient_id: str = Form("Unknown"),
-    notes: str = Form("N/A")
+    power: float = Form(2.0),
+    alpha: float = Form(0.5)
 ):
     try:
-        contents = await file.read()
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp.write(contents)
-            tmp_path = tmp.name
+        # --- Load and preprocess image ---
+        original_img, img_array = load_image(file)
+        preds = model.predict(img_array)
+        prob = float(preds[0][0])
+        label = "Pneumonia" if prob > 0.5 else "Normal"
+
+        # --- Generate Grad-CAM heatmap ---
+        heatmap = generate_gradcam(model, img_array, power=power)
+        heatmap_img = overlay_heatmap(original_img, heatmap, alpha=alpha)
+
+        # --- Save both images ---
+        os.makedirs("static", exist_ok=True)
+        orig_path = f"static/{file.filename}_orig.jpg"
+        heatmap_path = f"static/{file.filename}_heatmap.jpg"
+        Image.fromarray(original_img).save(orig_path)
+        heatmap_img.save(heatmap_path)
+
+        # --- Create PDF report ---
+        pdf = create_pdf_report(orig_path, heatmap_path, label, prob)
+
+        # --- Return result UI (shows images + link) ---
+        html_response = f"""
+        <html>
+        <head><title>Prediction Result</title></head>
+        <body style="font-family: Arial; margin: 50px;">
+            <h2>Prediction: {label}</h2>
+            <h3>Confidence: {prob * 100:.2f}%</h3>
+            <div style="display:flex; gap:40px; align-items:center;">
+                <div>
+                    <h4>Original X-ray</h4>
+                    <img src="/{orig_path}" width="300" style="border:1px solid #ddd; border-radius:8px;">
+                </div>
+                <div>
+                    <h4>Grad-CAM Heatmap</h4>
+                    <img src="/{heatmap_path}" width="300" style="border:1px solid #ddd; border-radius:8px;">
+                </div>
+            </div>
+            <br><br>
+            <a href="/{heatmap_path}" target="_blank">🔍 View Heatmap Fullscreen</a><br><br>
+            <a href="/download_pdf?path={pdf.name}" download>📄 Download Report (PDF)</a><br><br>
+            <a href="/">⬅ Go Back</a>
+        </body>
+        </html>
+        """
+        return HTMLResponse(content=html_response, status_code = 200)
+
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Cannot save uploaded file: {e}")
+        return JSONResponse(status_code=500, content={"detail": f"Error: {str(e)}"})
 
-    try:
-        # Auto-detect DICOM vs normal image
-        if imghdr.what(tmp_path):
-            # Normal image (JPG, PNG)
-            img = Image.open(tmp_path).convert("RGB").resize((224, 224))
-            img = np.array(img) / 255.0
-            ds = None
-        else:
-            # DICOM
-            img, ds = read_dicom_as_image(tmp_path)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error processing image: {e}")
-
-    img_batch = np.expand_dims(img, axis=0)
-    prob = float(model.predict(img_batch)[0, 0])
-    label = "Pneumonia" if prob >= 0.5 else "Normal"
-
-    # Collect metadata
-    patient_info = {
-        "PatientName": patient_name if patient_name != "Unknown" else getattr(ds, "PatientName", "Unknown") if ds else "Unknown",
-        "PatientID": patient_id if patient_id != "Unknown" else getattr(ds, "PatientID", "Unknown") if ds else "Unknown",
-        "StudyDate": getattr(ds, "StudyDate", "Unknown") if ds else "Unknown",
-        "Notes": notes
-    }
-
-    pdf_buffer = make_pdf_report(patient_info, prob, label)
-    return StreamingResponse(
-        pdf_buffer,
-        media_type='application/pdf',
-        headers={"Content-Disposition": "attachment; filename=report.pdf"}
-    )
-
-# ----------------------------------------------------
-# Run server
-# ----------------------------------------------------
-if __name__ == "__main__":
-    uvicorn.run("predict_api:app", host="0.0.0.0", port=8000, reload=True)
-
-
-# from fastapi import FastAPI, File, UploadFile, HTTPException
-# from fastapi.responses import StreamingResponse
-# import uvicorn
-# import numpy as np  
-# import io
-# import tempfile
-# import pydicom
-# from tensorflow.keras.models import load_model
-# from tensorflow.keras.preprocessing.image import img_to_array
-# from reportlab.lib.pagesizes import letter
-# from reportlab.pdfgen import canvas
-# from reportlab.lib.utils import ImageReader
-# import matplotlib.pyplot as plt
-# import tensorflow as tf
-# import cv2
-
-# app = FastAPI()
-
-# MODEL_PATH = "saved_models/densenet_pneumonia.h5"
-# model = load_model(MODEL_PATH)
-
-# # --- GRAD-CAM FUNCTION ---
-# def generate_gradcam(model, img_array, layer_name):
-#     grad_model = tf.keras.models.Model(
-#         [model.inputs], 
-#         [model.get_layer(layer_name).output, model.output]
-#     )
-#     with tf.GradientTape() as tape:
-#         conv_outputs, predictions = grad_model(img_array)
-#         loss = predictions[:, 0]
-
-#     grads = tape.gradient(loss, conv_outputs)
-#     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-#     conv_outputs = conv_outputs[0]
-#     heatmap = tf.reduce_mean(tf.multiply(pooled_grads, conv_outputs), axis=-1)
-#     heatmap = np.maximum(heatmap, 0) / (np.max(heatmap) + 1e-8)
-#     return heatmap.numpy()
-
-# def overlay_heatmap(heatmap, image, alpha=0.4):
-#     heatmap = cv2.resize(heatmap, (image.shape[1], image.shape[0]))
-#     heatmap = np.uint8(255 * heatmap)
-#     heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-#     overlayed = cv2.addWeighted(image, 1 - alpha, heatmap_color, alpha, 0)
-#     return overlayed
-
-# # --- PDF REPORT WITH HEATMAP ---
-# def make_pdf_report(patient_info, predicted_prob, label, gradcam_image):
-#     buffer = io.BytesIO()
-#     c = canvas.Canvas(buffer, pagesize=letter)
-#     width, height = letter
-
-#     # Header
-#     c.setFont("Helvetica-Bold", 16)
-#     c.drawString(40, height - 60, "Pneumonia Detection Report")
-
-#     # Patient Info
-#     c.setFont("Helvetica", 12)
-#     y = height - 100
-#     for key in ["PatientName", "PatientID", "StudyDate"]:
-#         c.drawString(40, y, f"{key}: {patient_info.get(key, 'Unknown')}")
-#         y -= 20
-
-#     # Prediction Results
-#     c.drawString(40, y - 10, f"Prediction: {label}")
-#     c.drawString(40, y - 30, f"Probability (Pneumonia): {predicted_prob:.3f}")
-
-#     # Insert Grad-CAM Image
-#     img_reader = ImageReader(gradcam_image)
-#     c.drawImage(img_reader, 40, 150, width=500, height=350)
-
-#     c.setFont("Helvetica-Oblique", 10)
-#     c.drawString(40, 130, "Grad-CAM visualization: Red areas indicate regions influencing the model's decision")
-
-#     c.showPage()
-#     c.save()
-#     buffer.seek(0)
-#     return buffer
-
-# # --- MAIN PREDICT ENDPOINT ---
-# @app.post("/predict/")
-# async def predict_dicom(file: UploadFile = File(...)):
-#     try:
-#         contents = await file.read()
-#         with tempfile.NamedTemporaryFile(delete=False, suffix=".dcm") as tmp:
-#             tmp.write(contents)
-#             tmp_path = tmp.name
-#         ds = pydicom.dcmread(tmp_path, force=True)
-#         if 'TransferSyntaxUID' not in ds.file_meta:
-#             ds.file_meta.TransferSyntaxUID = pydicom.uid.ImplicitVRLittleEndian
-#         ds.decompress()
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail=f"Cannot read DICOM file: {e}")
-
-#     # Extract metadata
-#     patient_info = {tag: getattr(ds, tag, 'Unknown') for tag in ['PatientName', 'PatientID', 'StudyDate']}
-
-#     # Decode pixel data
-#     try:
-#         img = ds.pixel_array
-#         img = cv2.resize(img, (224, 224))
-#         if len(img.shape) == 2:
-#             img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-#         img_norm = img / 255.0
-#         img_batch = np.expand_dims(img_norm, axis=0)
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail=f"Error processing image: {e}")
-
-#     # Model prediction
-#     prob = float(model.predict(img_batch)[0, 0])
-#     label = "Pneumonia" if prob >= 0.5 else "Normal"
-
-#     # Generate Grad-CAM
-#     last_conv_layer = model.layers[-3].name  # Adjust if needed
-#     heatmap = generate_gradcam(model, img_batch, last_conv_layer)
-#     gradcam_overlay = overlay_heatmap(heatmap, np.uint8(img))
-
-#     # Save Grad-CAM to memory
-#     _, gradcam_png = cv2.imencode('.png', gradcam_overlay)
-#     gradcam_bytes = io.BytesIO(gradcam_png)
-
-#     # Create PDF report
-#     pdf_buffer = make_pdf_report(patient_info, prob, label, gradcam_bytes)
-
-#     return StreamingResponse(
-#         pdf_buffer,
-#         media_type='application/pdf',
-#         headers={"Content-Disposition": "attachment; filename=report.pdf"}
-#     )
-
-# if __name__ == "__main__":
-#     uvicorn.run("predict_api:app", host="0.0.0.0", port=8000, reload=True)
+@app.get("/download_pdf")
+def download_pdf(path: str):
+    pdf_file = open(path, "rb")
+    return StreamingResponse(pdf_file, media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=report.pdf"})
