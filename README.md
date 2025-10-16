@@ -1,24 +1,23 @@
-# Pneumonia Detection using Deep Learning 🩺
+# 🩺 Pneumonia Detection with Explainable AI (Grad-CAM + FastAPI)
 
-A FastAPI-based web service for detecting pneumonia from chest X-ray DICOM images using a DenseNet model.
+This project detects Pneumonia from chest X-ray images using a DenseNet model and provides visual explanations using Grad-CAM.  
+It includes a web interface built with FastAPI and auto-generated diagnostic reports in PDF.
 
-## Features
-- Upload DICOM or jpeg images for analysis
-- Outputs a downloadable PDF report with patient info and prediction
-- REST API built with FastAPI
+## 🚀 Features
+- Upload chest X-rays (JPG, PNG, DICOM)
+- AI prediction (Normal vs Pneumonia)
+- Grad-CAM visualization
+- Adjustable contrast & transparency
+- PDF report generator
+- Ready for cloud deployment (AWS/GCP)
 
-## How to Run
+## 🧠 Model
+- Architecture: DenseNet121 (transfer learning)
+- Dataset: [ChestX-ray Pneumonia Dataset (Kaggle)](https://www.kaggle.com/paultimothymooney/chest-xray-pneumonia)
+
+## 🖥️ Run Locally
 ```bash
-# 1. Clone the repo
-git clone https://github.com/YOUR_USERNAME/pneumonia-detection.git
+git clone https://github.com/<your-username>/pneumonia-detection.git
 cd pneumonia-detection
-
-# 2. Create and activate a virtual environment
-python -m venv venv
-venv\Scripts\activate   # (Windows)
-
-# 3. Install dependencies
 pip install -r requirements.txt
-
-# 4. Run the API
-uvicorn src.predict_api:app --reload --port 8000
+uvicorn src.predict_api:app --reload
